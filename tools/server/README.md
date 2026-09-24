@@ -793,6 +793,50 @@ curl http://127.0.0.1:8012/v1/rerank \
     }' | jq
 ```
 
+
+### POST `/v1/systemone`: AutoJev classification
+
+Runs the AutoJev classifier head against one or more questions about a shared state. Start with an AutoJev classifier GGUF and `--reranking` (equivalent to `--embedding --pooling rank`). Image requests also require the matching `--mmproj`.
+
+*Request fields:*
+
+- `model`: `autojev`, `jev-latest`, `jev-preview`, `jev-1.13.0`, or the service name derived from the GGUF base-model metadata.
+- `state`: a string, object, or array shared by every question.
+- `questions`: a non-empty object mapping question IDs to question definitions:
+  - `choice`: `criteria` is an object with 1–255 option descriptions.
+  - `score`: `criteria` is an array of 2–10 ordered descriptions.
+  - `noul`: optional `criteria` object with `false` and/or `true` descriptions.
+  - Each question may also provide `instructions`.
+- `images`: optional array of up to four PNG, JPEG, or WebP base64 data URIs. Each decoded image is limited to 8 MB and 16 megapixels. Image token bounds default to the AutoJev GGUF metadata; explicit `--image-min-tokens` and `--image-max-tokens` values override them.
+
+`answers` maps question IDs to their classifications. Choice answers include `probabilities`, `choice`, and `confidence`; score answers include `probabilities`, `score`, `confidence`, and `legend`; noul answers include the `noul` probability. `usage.input_tokens` sums prompt tokens over all questions, and `usage.output_tokens` is always `0`. The response `model` is the metadata-derived service name. Requests that exceed the configured per-slot context are rejected.
+
+*Example:*
+
+```shell
+curl http://127.0.0.1:8012/v1/systemone \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "autojev",
+        "state": "Three payouts failed, but login still works.",
+        "questions": {
+            "route": {
+                "type": "choice",
+                "instructions": "Which team should handle this issue?",
+                "criteria": {
+                    "payments": "Payout failures and billing",
+                    "account": "Login and account access",
+                    "other": "Anything else"
+                }
+            },
+            "urgent": {
+                "type": "noul",
+                "instructions": "Does this need urgent attention?"
+            }
+        }
+    }' | jq
+```
+
 ### POST `/infill`: For code infilling.
 
 Takes a prefix and a suffix and returns the predicted completion as stream.

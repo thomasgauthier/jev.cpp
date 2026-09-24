@@ -81,6 +81,31 @@ def test_invalid_rerank_req(documents):
     assert "error" in res.body
 
 
+def test_systemone_rejects_unknown_model_and_malformed_questions():
+    global server
+    server.start()
+
+    valid_question = {
+        "type": "choice",
+        "criteria": {"payments": "Billing"},
+    }
+    unsupported = server.make_request("POST", "/v1/systemone", data={
+        "model": "not-an-autojev-model",
+        "state": "A payment issue",
+        "questions": {"route": valid_question},
+    })
+    assert unsupported.status_code == 400
+    assert unsupported.body["error"]["type"] == "invalid_request_error"
+
+    malformed = server.make_request("POST", "/v1/systemone", data={
+        "model": "autojev",
+        "state": "A payment issue",
+        "questions": {"route": {"type": "choice"}},
+    })
+    assert malformed.status_code == 400
+    assert "criteria" in malformed.body["error"]["message"]
+
+
 @pytest.mark.parametrize(
     "query,doc1,doc2,n_tokens",
     [

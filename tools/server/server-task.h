@@ -152,6 +152,7 @@ struct server_task {
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
     server_tokens tokens;
+    bool capture_classifier_logits = false; // used by AutoJev through SERVER_TASK_TYPE_RERANK
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -468,6 +469,7 @@ struct server_task_result_embd : server_task_result {
 
 struct server_task_result_rerank : server_task_result {
     float score = -1e6;
+    std::vector<float> classifier_logits;
 
     int32_t n_tokens;
 

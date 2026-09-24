@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 from typing import Any, Callable, Iterable, TYPE_CHECKING
 
@@ -634,10 +635,105 @@ class _Qwen35MRopeMixin:
             self.gguf_writer.add_rope_dimension_sections(self._QWEN35_DEFAULT_MROPE_SECTION)
 
 
-@ModelBase.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM")
+@ModelBase.register("Qwen3_5Model", "Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM")
 @ModelBase.example("Qwen/Qwen3.5-9B")
 class Qwen3_5TextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35
+
+    def __init__(self, dir_model, *args, **kwargs):
+        hparams = kwargs.pop("hparams", None)
+        if hparams is None:
+            hparams = ModelBase.load_hparams(dir_model, is_mistral_format=False)
+        super().__init__(dir_model, *args, hparams=hparams, **kwargs)
+
+        self.autojev_config: dict[str, Any] | None = None
+        config_path = self.dir_model / "decision_config.json"
+        if not config_path.is_file():
+            return
+
+        with config_path.open("r", encoding="utf-8") as f:
+            config = json.load(f)
+        codes = config.get("codes")
+        token_ids = config.get("token_ids")
+        temperature = config.get("temperature")
+        format_version = config.get("format_version")
+        if type(format_version) is not int or format_version != 1:
+            raise ValueError("Unsupported AutoJev decision checkpoint format.")
+        if not isinstance(codes, list) or len(codes) != 255 or any(not isinstance(code, str) or not code for code in codes) or len(set(codes)) != 255:
+            raise ValueError("AutoJev requires 255 unique, nonempty answer codes.")
+        if not isinstance(token_ids, list) or len(token_ids) != 255 or any(type(token_id) is not int for token_id in token_ids) or len(set(token_ids)) != 255:
+            raise ValueError("AutoJev requires 255 unique answer token IDs.")
+        if any(token_id < 0 or token_id >= self.hparams["vocab_size"] for token_id in token_ids):
+            raise ValueError("AutoJev answer token ID is outside the model vocabulary.")
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("AutoJev temperature must be finite and positive.")
+        self.autojev_config = config
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        if name.startswith("language_model."):
+            name = "model." + name[len("language_model."):]
+        elif name.startswith("model.language_model."):
+            name = "model." + name[len("model.language_model."):]
+        return super().filter_tensors((name, gen))
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        yield from super().generate_extra_tensors()
+        if self.autojev_config is None:
+            return
+
+        from safetensors.torch import load_file
+        tensors = load_file(self.dir_model / "readout.safetensors")
+        if set(tensors) != {"weight"}:
+            raise ValueError("AutoJev readout.safetensors must contain only the weight tensor.")
+        weight = tensors["weight"]
+        expected_shape = (len(self.autojev_config["codes"]), self.hparams["hidden_size"])
+        if tuple(weight.shape) != expected_shape:
+            raise ValueError(f"AutoJev readout has shape {tuple(weight.shape)}, expected {expected_shape}.")
+        yield "autojev.readout.weight", weight
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        if self.autojev_config is None:
+            return
+
+        writer = self.gguf_writer
+        codes = self.autojev_config["codes"]
+        writer.add_pooling_type(gguf.PoolingType.RANK)
+        writer.add_classifier_output_labels(codes)
+        writer.add_uint32("autojev.format_version", self.autojev_config["format_version"])
+        writer.add_string("autojev.temperature", repr(float(self.autojev_config["temperature"])))
+        writer.add_array("autojev.codes", codes)
+        writer.add_array("autojev.token_ids", self.autojev_config["token_ids"])
+
+        processor_path = self.dir_model / "processor_config.json"
+        if not processor_path.is_file():
+            raise ValueError("AutoJev image processor configuration is missing.")
+        with processor_path.open("r", encoding="utf-8") as f:
+            processor = json.load(f).get("image_processor", {})
+        size = processor.get("size", {})
+        patch_size = processor.get("patch_size")
+        merge_size = processor.get("merge_size")
+        min_pixels = size.get("shortest_edge")
+        max_pixels = size.get("longest_edge")
+        if any(type(value) is not int or value <= 0 for value in (patch_size, merge_size, min_pixels, max_pixels)):
+            raise ValueError("AutoJev image processor must define positive pixel and patch sizes.")
+        pixels_per_token = (patch_size * merge_size) ** 2
+        if min_pixels % pixels_per_token or max_pixels % pixels_per_token:
+            raise ValueError("AutoJev pixel bounds must align to the image token patch area.")
+        min_tokens = min_pixels // pixels_per_token
+        max_tokens = max_pixels // pixels_per_token
+        if min_tokens > max_tokens:
+            raise ValueError("AutoJev minimum image size exceeds its maximum.")
+        writer.add_uint32("autojev.image_min_tokens", min_tokens)
+        writer.add_uint32("autojev.image_max_tokens", max_tokens)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name == "autojev.readout.weight":
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.CLS_OUT), data_torch
+            return
+        yield from super().modify_tensors(data_torch, name, bid)
 
 
 @ModelBase.register("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM")

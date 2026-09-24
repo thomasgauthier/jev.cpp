@@ -51,13 +51,16 @@ server_http_context::~server_http_context() {
 }
 
 static void log_server_request(const httplib::Request & req, const httplib::Response & res) {
-    // skip logging requests that are regularly sent, to avoid log spam
+    static const std::string systemone_path = "/v1/systemone";
+    const bool is_systemone = req.path.size() >= systemone_path.size() &&
+        req.path.compare(req.path.size() - systemone_path.size(), systemone_path.size(), systemone_path) == 0;
+    // Skip frequently polled routes and requests containing potentially sensitive state or images.
     if (req.path == "/health"
         || req.path == "/v1/health"
         || req.path == "/models"
         || req.path == "/v1/models"
         || req.path == "/props"
-        || req.path == "/metrics"
+        || is_systemone
     ) {
         return;
     }

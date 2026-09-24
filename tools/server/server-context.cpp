@@ -1,3 +1,4 @@
+#include "autojev-common.h"
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -16,6 +17,9 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include <cstdint>
+#include <initializer_list>
+#include <string_view>
 
 #include <algorithm>
 #include <cstddef>
@@ -50,6 +54,24 @@ static common_speculative_output_limits server_output_limits(const common_params
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
     return result;
+}
+
+static bool autojev_is_content(const autojev::json & value) {
+    return value.is_string() || value.is_object() || value.is_array();
+}
+
+static bool autojev_has_only_fields(
+        const autojev::json & value,
+        std::initializer_list<std::string_view> fields) {
+    if (!value.is_object()) {
+        return false;
+    }
+    for (auto it = value.begin(); it != value.end(); ++it) {
+        if (std::find(fields.begin(), fields.end(), std::string_view(it.key())) == fields.end()) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
@@ -436,14 +458,17 @@ struct server_slot {
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
-    // also we cannot split if the pooling would require any past tokens
-    // (MTP supports splitting — uses task->need_embd() not need_embd())
+    // also we cannot split if pooling would require past tokens
+    // AutoJev Qwen classifier tasks use rank pooling on the final token and can split across ubatches
     bool can_split() const {
         GGML_ASSERT(task);
 
+        const auto pooling_type = llama_pooling_type(ctx_tgt);
         return
             !task->need_embd() ||
-            (llama_get_memory(ctx_tgt) && llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST);
+            (llama_get_memory(ctx_tgt) &&
+             (pooling_type == LLAMA_POOLING_TYPE_LAST ||
+              (pooling_type == LLAMA_POOLING_TYPE_RANK && task->capture_classifier_logits)));
     }
 
     bool can_batch_with(server_slot & other_slot) const {
@@ -1159,6 +1184,16 @@ private:
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
 
+            if (autojev::has_classifier_metadata(model_tgt)) {
+                if (params_base.image_min_tokens < 0) {
+                    params_base.image_min_tokens = static_cast<int>(autojev::metadata_u32(model_tgt, "autojev.image_min_tokens"));
+                }
+                if (params_base.image_max_tokens < 0) {
+                    params_base.image_max_tokens = static_cast<int>(autojev::metadata_u32(model_tgt, "autojev.image_max_tokens"));
+                }
+                mparams.image_min_tokens = params_base.image_min_tokens;
+                mparams.image_max_tokens = params_base.image_max_tokens;
+            }
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
             if (mctx == nullptr) {
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
@@ -2218,6 +2253,10 @@ private:
             }
 
             res->score = embd[0];
+            if (slot.task->capture_classifier_logits) {
+                const uint32_t n_cls_out = llama_model_n_cls_out(model_tgt);
+                res->classifier_logits.assign(embd, embd + n_cls_out);
+            }
         }
 
         SLT_DBG(slot, "sending rerank result, res.score = %f\n", res->score);
@@ -5221,6 +5260,272 @@ void server_routes::init_routes() {
             top_n);
 
         res->ok(root);
+        return res;
+    };
+    this->post_systemone = [this](const server_http_req & req) {
+        auto res = create_response();
+        auto reject = [&](const std::string & message, error_type type = ERROR_TYPE_INVALID_REQUEST) {
+            res->error(format_error_response(message, type));
+            return std::move(res);
+        };
+
+        if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
+            return reject("This server does not support classifier inference. Start it with `--reranking`", ERROR_TYPE_NOT_SUPPORTED);
+        }
+
+        autojev::json body;
+        try {
+            body = autojev::json::parse(req.body);
+        } catch (const std::exception & e) {
+            return reject(std::string("Invalid JSON request: ") + e.what());
+        }
+        if (!body.is_object() || !autojev_has_only_fields(body, {"model", "state", "questions", "images"})) {
+            return reject("Request must be an object containing only model, state, questions, and optional images");
+        }
+        if (!body.contains("model") || !body["model"].is_string()) {
+            return reject("\"model\" must be a string");
+        }
+        if (!body.contains("state") || !autojev_is_content(body["state"])) {
+            return reject("\"state\" must be a string, object, or array");
+        }
+        if (!body.contains("questions") || !body["questions"].is_object() || body["questions"].empty()) {
+            return reject("\"questions\" must be a non-empty object");
+        }
+
+        const std::string response_model = autojev::service_model_name(ctx_server.model_tgt);
+        const std::string requested_model = body["model"].get<std::string>();
+        if (requested_model != "autojev" && requested_model != "jev-latest" &&
+                requested_model != "jev-preview" && requested_model != "jev-1.13.0" &&
+                requested_model != response_model) {
+            return reject("\"model\" is not a supported AutoJev model");
+        }
+
+        autojev::json images = autojev::json::array();
+        if (body.contains("images")) {
+            if (!body["images"].is_array()) {
+                return reject("\"images\" must be an array of data URIs");
+            }
+            images = body["images"];
+        }
+        if (images.size() > 4) {
+            return reject("At most four images may be supplied");
+        }
+
+        std::vector<autojev::option_set> option_sets;
+        option_sets.reserve(body["questions"].size());
+        for (auto it = body["questions"].begin(); it != body["questions"].end(); ++it) {
+            const auto & question = it.value();
+            if (!question.is_object() || !autojev_has_only_fields(question, {"type", "criteria", "instructions"})) {
+                return reject("Each question must be an object containing only type, criteria, and optional instructions");
+            }
+            if (!question.contains("type") || !question["type"].is_string()) {
+                return reject("Each question must have a string type");
+            }
+            if (question.contains("instructions") && !question["instructions"].is_null() &&
+                    !autojev_is_content(question["instructions"])) {
+                return reject("Question instructions must be a string, object, or array");
+            }
+
+            const std::string type = question["type"].get<std::string>();
+            if (type == "choice") {
+                if (!question.contains("criteria") || !question["criteria"].is_object()) {
+                    return reject("Choice criteria must be an object");
+                }
+                for (auto criterion = question["criteria"].begin(); criterion != question["criteria"].end(); ++criterion) {
+                    if (!criterion.value().is_null() && !autojev_is_content(criterion.value())) {
+                        return reject("Choice descriptions must be strings, objects, arrays, or null");
+                    }
+                }
+            } else if (type == "score") {
+                if (!question.contains("criteria") || !question["criteria"].is_array() ||
+                        question["criteria"].size() < 2 || question["criteria"].size() > 10) {
+                    return reject("Score criteria must contain two to ten descriptions");
+                }
+                for (const auto & criterion : question["criteria"]) {
+                    if (!autojev_is_content(criterion)) {
+                        return reject("Score descriptions must be strings, objects, or arrays");
+                    }
+                }
+            } else if (type == "noul") {
+                if (question.contains("criteria") && !question["criteria"].is_null() &&
+                        !question["criteria"].is_object()) {
+                    return reject("Noul criteria must be an object or null");
+                }
+                if (question.contains("criteria") && question["criteria"].is_object()) {
+                    for (auto criterion = question["criteria"].begin(); criterion != question["criteria"].end(); ++criterion) {
+                        if (criterion.key() != "false" && criterion.key() != "true") {
+                            return reject("Noul criteria may contain only false and true descriptions");
+                        }
+                        if (!criterion.value().is_null() && !autojev_is_content(criterion.value())) {
+                            return reject("Noul descriptions must be strings, objects, arrays, or null");
+                        }
+                    }
+                }
+            } else {
+                return reject("Question type must be choice, noul, or score");
+            }
+
+            try {
+                option_sets.push_back(autojev::build_options(question));
+            } catch (const std::exception & e) {
+                return reject(e.what());
+            }
+        }
+
+        std::vector<raw_buffer> files;
+        files.reserve(images.size());
+        for (const auto & image : images) {
+            if (!image.is_string()) {
+                return reject("Each image must be a PNG, JPEG, or WebP base64 data URI");
+            }
+            const std::string & data_uri = image.get_ref<const std::string &>();
+            const size_t comma = data_uri.find(',');
+            if (comma == std::string::npos) {
+                return reject("Image must use a PNG, JPEG, or WebP base64 data URI");
+            }
+            const std::string_view header(data_uri.data(), comma);
+            if (header != "data:image/png;base64" && header != "data:image/jpeg;base64" &&
+                    header != "data:image/webp;base64") {
+                return reject("Image must use a PNG, JPEG, or WebP base64 data URI");
+            }
+            const std::string_view encoded(data_uri.data() + comma + 1, data_uri.size() - comma - 1);
+            if (encoded.size() > 12'000'000) {
+                return reject("Encoded images may not exceed 12 MB");
+            }
+            try {
+                auto decoded = autojev::decode_base64(encoded);
+                if (decoded.empty() || decoded.size() > 8'000'000) {
+                    return reject("Decoded images must contain at most 8 MB of data");
+                }
+                files.emplace_back(std::move(decoded));
+            } catch (const std::exception & e) {
+                return reject(e.what());
+            }
+        }
+        if (!files.empty() && ctx_server.mctx == nullptr) {
+            return reject("The current model does not support image input; load it with `--mmproj`", ERROR_TYPE_NOT_SUPPORTED);
+        }
+
+        double temperature = 0.0;
+        std::vector<std::string> codes;
+        try {
+            codes = autojev::validate_classifier(ctx_server.model_tgt, temperature);
+        } catch (const std::exception & e) {
+            return reject(e.what(), ERROR_TYPE_NOT_SUPPORTED);
+        }
+
+        auto & rd = res->rd;
+        struct question_info {
+            std::string id;
+            const autojev::json * question;
+            autojev::option_set options;
+        };
+        std::vector<question_info> question_data;
+        question_data.reserve(body["questions"].size());
+        std::vector<server_task> tasks;
+        tasks.reserve(body["questions"].size());
+
+        mtmd::bitmaps bitmaps;
+        std::vector<mtmd_helper::video_ptr> video_contexts;
+        try {
+            for (const auto & file : files) {
+                auto decoded = mtmd_helper_bitmap_init_from_buf(
+                    ctx_server.mctx, file.data(), file.size(), false, ctx_server.init_opt);
+                mtmd::bitmap bitmap(decoded.bitmap);
+                mtmd_helper::video_ptr video_context(decoded.video_ctx);
+                if (!bitmap.ptr) {
+                    return reject("Failed to decode image data");
+                }
+                const uint64_t pixels = static_cast<uint64_t>(bitmap.nx()) * bitmap.ny();
+                if (pixels > 16'000'000) {
+                    return reject("Images may not exceed 16 megapixels");
+                }
+                bitmaps.entries.emplace_back(std::move(bitmap));
+                if (video_context) {
+                    video_contexts.emplace_back(std::move(video_context));
+                }
+            }
+
+            const auto & templates = meta->chat_params.tmpls;
+            if (!templates) {
+                return reject("The loaded model has no chat template", ERROR_TYPE_NOT_SUPPORTED);
+            }
+            size_t question_index = 0;
+            for (auto it = body["questions"].begin(); it != body["questions"].end(); ++it, ++question_index) {
+                const std::string user_prompt = autojev::build_user_prompt(
+                    body["state"], it.value(), codes, option_sets[question_index], files.size(), get_media_marker());
+                common_chat_msg system;
+                system.role = "system";
+                system.content = autojev::system_prompt;
+                common_chat_msg user;
+                user.role = "user";
+                user.content = user_prompt;
+                common_chat_templates_inputs inputs;
+                inputs.messages = {system, user};
+                inputs.enable_thinking = false;
+                inputs.add_generation_prompt = true;
+                const common_chat_params rendered = common_chat_templates_apply(templates.get(), inputs);
+
+                server_task task(SERVER_TASK_TYPE_RERANK);
+                task.id = rd.get_new_id();
+                task.index = question_index;
+                task.capture_classifier_logits = true;
+                if (bitmaps.entries.empty()) {
+                    task.tokens = server_tokens(tokenize_mixed(ctx_server.vocab, rendered.prompt, true, true), false);
+                } else {
+                    mtmd_input_text input_text = {
+                        rendered.prompt.data(),
+                        rendered.prompt.size(),
+                        true,
+                        true,
+                    };
+                    mtmd::input_chunks chunks(mtmd_input_chunks_init());
+                    const auto bitmap_ptrs = bitmaps.c_ptr();
+                    const int32_t tokenized = mtmd_tokenize(
+                        ctx_server.mctx, chunks.ptr.get(), &input_text, bitmap_ptrs.data(), bitmap_ptrs.size());
+                    if (tokenized != 0) {
+                        throw std::runtime_error("Failed to tokenize AutoJev prompt");
+                    }
+                    task.tokens = server_tokens(chunks, true);
+                }
+                question_data.push_back({it.key(), &it.value(), std::move(option_sets[question_index])});
+                tasks.push_back(std::move(task));
+            }
+        } catch (const std::exception & e) {
+            return reject(std::string("Failed to format AutoJev input: ") + e.what());
+        }
+
+        rd.post_tasks(std::move(tasks));
+        const auto all_results = rd.wait_for_all(req.should_stop);
+        if (all_results.is_terminated) {
+            return res;
+        }
+        if (all_results.error) {
+            res->error(all_results.error->to_json());
+            return res;
+        }
+
+        autojev::json answers = autojev::json::object();
+        size_t input_tokens = 0;
+        for (const auto & result : all_results.results) {
+            const auto * rerank = dynamic_cast<const server_task_result_rerank *>(result.get());
+            if (rerank == nullptr || rerank->index >= question_data.size()) {
+                return reject("Server returned an invalid classifier result", ERROR_TYPE_SERVER);
+            }
+            const auto & question = question_data[rerank->index];
+            const auto probs = autojev::probabilities(rerank->classifier_logits, question.options.keys.size(), temperature);
+            answers[question.id] = autojev::make_answer(*question.question, question.options, probs);
+            input_tokens += static_cast<size_t>(rerank->n_tokens);
+        }
+
+        autojev::json response;
+        response["model"] = response_model;
+        response["answers"] = std::move(answers);
+        response["usage"] = autojev::json{
+            {"input_tokens", input_tokens},
+            {"output_tokens", 0},
+        };
+        res->ok(json::parse(response.dump()));
         return res;
     };
 
