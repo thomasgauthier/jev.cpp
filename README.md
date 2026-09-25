@@ -34,6 +34,8 @@ llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
 
 # Launch OpenAI-compatible API server
 llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+# Serve an AutoJev classifier at /v1/systemone; add --mmproj PATH for image requests
+llama-server -m /path/to/autojev-Q4_K_M.gguf --system-one
 ```
 
 <table align="center">
