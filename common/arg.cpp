@@ -877,6 +877,15 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
 
+    if (params.system_one) {
+        if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
+                params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
+            throw std::invalid_argument("--system-one requires rank pooling; use --pooling rank");
+        }
+        params.embedding = true;
+        params.pooling_type = LLAMA_POOLING_TYPE_RANK;
+    }
+
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
@@ -3474,6 +3483,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("restrict to only support embedding use case; use only with dedicated embedding models (default: %s)", params.embedding ? "enabled" : "disabled"),
         [](common_params & params) {
             params.embedding = true;
+            params.embedding_endpoint = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}).set_env("LLAMA_ARG_EMBEDDINGS"));
     add_opt(common_arg(
@@ -3482,8 +3492,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.embedding = true;
             params.pooling_type = LLAMA_POOLING_TYPE_RANK;
+            params.reranking_endpoint = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RERANKING"));
+    add_opt(common_arg(
+        {"--system-one"},
+        "enable AutoJev classifier endpoint without enabling reranking or embedding endpoints",
+        [](common_params & params) {
+            params.system_one = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SYSTEM_ONE"));
     add_opt(common_arg(
         {"--api-key"}, "KEY",
         "API key to use for authentication, multiple keys can be provided as a comma-separated list (default: none)",

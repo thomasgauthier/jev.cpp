@@ -193,6 +193,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
     server_child child; // only used in non-router mode
     server_routes routes(params, ctx_server);
     server_tools tools;
+    const bool expose_legacy_rank_routes = params.pooling_type == LLAMA_POOLING_TYPE_RANK &&
+        !params.system_one && (params.embedding_endpoint || params.reranking_endpoint);
+    const bool expose_embedding_routes = params.embedding_endpoint || params.reranking_endpoint;
+    const bool expose_rerank_routes = params.reranking_endpoint || expose_legacy_rank_routes;
+    const bool expose_system_one_route = params.system_one || expose_legacy_rank_routes;
 
     std::optional<server_models_routes> models_routes{};
 
@@ -268,14 +273,20 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
     ctx_http.post("/infill",                   ex_wrapper(routes.post_infill));
-    ctx_http.post("/embedding",                ex_wrapper(routes.post_embeddings)); // legacy
-    ctx_http.post("/embeddings",               ex_wrapper(routes.post_embeddings));
-    ctx_http.post("/v1/embeddings",            ex_wrapper(routes.post_embeddings_oai));
-    ctx_http.post("/rerank",                   ex_wrapper(routes.post_rerank));
-    ctx_http.post("/reranking",                ex_wrapper(routes.post_rerank));
-    ctx_http.post("/v1/rerank",                ex_wrapper(routes.post_rerank));
-    ctx_http.post("/v1/systemone",             ex_wrapper(routes.post_systemone));
-    ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
+    if (expose_embedding_routes) {
+        ctx_http.post("/embedding",               ex_wrapper(routes.post_embeddings)); // legacy
+        ctx_http.post("/embeddings",              ex_wrapper(routes.post_embeddings));
+        ctx_http.post("/v1/embeddings",           ex_wrapper(routes.post_embeddings_oai));
+    }
+    if (expose_rerank_routes) {
+        ctx_http.post("/rerank",                  ex_wrapper(routes.post_rerank));
+        ctx_http.post("/reranking",               ex_wrapper(routes.post_rerank));
+        ctx_http.post("/v1/rerank",               ex_wrapper(routes.post_rerank));
+        ctx_http.post("/v1/reranking",            ex_wrapper(routes.post_rerank));
+    }
+    if (expose_system_one_route) {
+        ctx_http.post("/v1/systemone",            ex_wrapper(routes.post_systemone));
+    }
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));

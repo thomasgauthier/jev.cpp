@@ -611,6 +611,9 @@ struct common_params {
 
     // embedding
     bool embedding         = false; // get only sentence embedding
+    bool embedding_endpoint  = false; // --embedding explicitly requests the HTTP embedding routes
+    bool reranking_endpoint  = false; // --reranking explicitly requests the HTTP reranking routes
+    bool system_one          = false; // --system-one requests the classifier route without other embedding APIs
     int32_t embd_normalize = 2;     // normalisation for embeddings (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm)
     std::string embd_out   = "";    // empty = default, "array" = [[],[]...], "json" = openai style, "json+" = same "json" + cosine similarity matrix
     std::string embd_sep   = "\n";  // separator of embeddings

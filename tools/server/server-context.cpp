@@ -5270,7 +5270,7 @@ void server_routes::init_routes() {
         };
 
         if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
-            return reject("This server does not support classifier inference. Start it with `--reranking`", ERROR_TYPE_NOT_SUPPORTED);
+            return reject("This server does not support classifier inference. Start it with `--system-one` or `--reranking`", ERROR_TYPE_NOT_SUPPORTED);
         }
 
         autojev::json body;

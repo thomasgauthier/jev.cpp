@@ -83,6 +83,7 @@ class ServerProcess:
     fa: str | None = None
     server_continuous_batching: bool | None = False
     server_embeddings: bool | None = False
+    server_system_one: bool = False
     server_reranking: bool | None = False
     server_metrics: bool | None = False
     kv_unified: bool | None = False
@@ -197,6 +198,8 @@ class ServerProcess:
             server_args.append("--embedding")
         if self.server_reranking:
             server_args.append("--reranking")
+        if self.server_system_one:
+            server_args.append("--system-one")
         if self.server_metrics:
             server_args.append("--metrics")
         if self.kv_unified:

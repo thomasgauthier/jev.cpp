@@ -209,6 +209,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--ui, --webui, --no-ui, --no-webui` | whether to enable the Web UI (default: enabled)<br/>(env: LLAMA_ARG_UI) |
 | `--embedding, --embeddings` | restrict to only support embedding use case; use only with dedicated embedding models (default: disabled)<br/>(env: LLAMA_ARG_EMBEDDINGS) |
 | `--rerank, --reranking` | enable reranking endpoint on server (default: disabled)<br/>(env: LLAMA_ARG_RERANKING) |
+| `--system-one` | enable AutoJev classifier endpoint without enabling reranking or embedding endpoints<br/>(env: LLAMA_ARG_SYSTEM_ONE) |
 | `--api-key KEY` | API key to use for authentication, multiple keys can be provided as a comma-separated list (default: none)<br/>(env: LLAMA_API_KEY) |
 | `--api-key-file FNAME` | path to file containing API keys, one per line; lines starting with a hash are treated as comments (default: none)<br/>(env: LLAMA_ARG_API_KEY_FILE) |
 | `--ssl-key-file FNAME` | path to file a PEM-encoded SSL private key<br/>(env: LLAMA_ARG_SSL_KEY_FILE) |
@@ -796,7 +797,9 @@ curl http://127.0.0.1:8012/v1/rerank \
 
 ### POST `/v1/systemone`: AutoJev classification
 
-Runs the AutoJev classifier head against one or more questions about a shared state. Start with an AutoJev classifier GGUF and `--reranking` (equivalent to `--embedding --pooling rank`). Image requests also require the matching `--mmproj`.
+Runs the AutoJev classifier head against one or more questions about a shared state. Start with an AutoJev classifier GGUF and `--system-one`; this enables rank-pooling internally but exposes only `/v1/systemone`. Image requests also require the matching `--mmproj`.
+
+`--reranking` remains backward-compatible: it enables the rerank routes, embedding routes, and `/v1/systemone`. Explicit `--embedding --pooling rank` retains the same legacy route set. Passing both `--system-one --reranking` enables both capabilities. Plain `--embedding` exposes only embedding routes. Disabled endpoint families are not registered and return 404. `--system-one` selects rank pooling regardless of argument order and rejects a conflicting non-rank `--pooling` value.
 
 *Request fields:*
 

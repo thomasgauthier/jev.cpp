@@ -1,3 +1,5 @@
+import os
+import subprocess
 import pytest
 from utils import *
 
@@ -107,6 +109,50 @@ def test_systemone_rejects_unknown_model_and_malformed_questions():
 
 
 @pytest.mark.parametrize(
+    "mode,embedding_enabled,rerank_enabled",
+    [
+        ("system_one", False, False),
+        ("reranking", True, True),
+        ("both", True, True),
+        ("explicit_rank_embedding", True, True),
+    ],
+)
+def test_classifier_and_embedding_route_capabilities(mode, embedding_enabled, rerank_enabled):
+    server = ServerPreset.jina_reranker_tiny()
+    server.server_reranking = mode in {"reranking", "both"}
+    server.server_system_one = mode in {"system_one", "both"}
+    server.server_embeddings = mode == "explicit_rank_embedding"
+    server.pooling = "rank" if mode == "explicit_rank_embedding" else None
+    server.start()
+
+    systemone = server.make_request("POST", "/v1/systemone", data={
+        "model": "autojev",
+        "state": "A payment issue",
+        "questions": {"route": {"type": "choice", "criteria": {"payments": "Billing"}}},
+    })
+    assert systemone.status_code == 501
+    assert "autojev.format_version" in systemone.body["error"]["message"]
+    if not embedding_enabled:
+        for path in ("/embedding", "/embeddings", "/v1/embeddings"):
+            assert server.make_request("POST", path, data={"input": "test"}).status_code == 404
+
+    if not rerank_enabled:
+        for path in ("/rerank", "/reranking", "/v1/rerank", "/v1/reranking"):
+            assert server.make_request(
+                "POST", path, data={"query": "test", "documents": ["test"]}
+            ).status_code == 404
+
+    if embedding_enabled:
+        embedding = server.make_request("POST", "/v1/embeddings", data={"input": "test"})
+        assert embedding.status_code == 200
+    if rerank_enabled:
+        rerank = server.make_request(
+            "POST", "/rerank", data={"query": "test", "documents": ["test"]}
+        )
+        assert rerank.status_code == 200
+
+
+@pytest.mark.parametrize(
     "query,doc1,doc2,n_tokens",
     [
         ("Machine learning is", "A machine", "Learning is", 19),
@@ -169,3 +215,19 @@ def test_rerank_tei_top_n(top_n, expected_len):
     res = server.make_request("POST", "/rerank", data=data)
     assert res.status_code == 200
     assert len(res.body) == expected_len
+
+
+def test_system_one_pooling_is_order_independent():
+    server_binary = os.environ["LLAMA_SERVER_BIN_PATH"]
+    for arguments in (["--system-one", "--pooling", "rank"], ["--pooling", "rank", "--system-one"]):
+        result = subprocess.run(
+            [server_binary, *arguments, "--help"], capture_output=True, text=True, check=False
+        )
+        assert result.returncode == 0, result.stderr
+
+    for arguments in (["--system-one", "--pooling", "mean"], ["--pooling", "mean", "--system-one"]):
+        result = subprocess.run(
+            [server_binary, *arguments, "--help"], capture_output=True, text=True, check=False
+        )
+        assert result.returncode == 1
+        assert "--system-one requires rank pooling" in result.stderr
